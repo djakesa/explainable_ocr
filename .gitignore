@@ -1,0 +1,36 @@
+# Fichiers Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environnements virtuels
+.env
+.venv/
+env/
+venv/
+
+# Fichiers de logs et temporaires
+*.log
+*.tmp
+*.swp
+
+# Dossiers de build / cache
+build/
+dist/
+*.egg-info/
+
+# Notebooks et sorties
+.ipynb_checkpoints/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Fichiers IDE
+.vscode/
+.idea/
+
+# Données locales
+data/
+output/
