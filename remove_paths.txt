@@ -1,0 +1,6 @@
+semaine_2/model/ods_yolov5_OCR_model.pt
+semaine_2/model/best.pt
+semaine_2/model/jhmi_yolov5_OCR_model.pt
+semaine_1/test/mnist/mnist_data/MNIST/raw/train-images-idx3-ubyte
+semaine_1/test/mnist/mnist_data/MNIST/raw/t10k-images-idx3-ubyte
+semaine_2/test/yolov8n-cls.pt
