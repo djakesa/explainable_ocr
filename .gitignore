@@ -4,6 +4,17 @@ __pycache__/
 *.pyo
 *.pyd
 
+# model IA
+
+*.pt
+
+#image et pdf 
+
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
 # Environnements virtuels
 .env
 .venv/
