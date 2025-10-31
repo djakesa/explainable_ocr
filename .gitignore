@@ -4,6 +4,11 @@ __pycache__/
 *.pyo
 *.pyd
 
+# MNIST/
+*/MNIST/
+*.ubyte
+
+
 # model IA
 
 *.pt
