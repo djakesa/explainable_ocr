@@ -1,0 +1,39 @@
+# -------------------------
+# Core Python / ML
+# -------------------------
+numpy==1.26.4
+scipy==1.11.4
+pillow==10.2.0
+
+# -------------------------
+# PyTorch (CPU ou CUDA auto)
+# -------------------------
+torch==2.2.2
+torchvision==0.17.2
+
+# -------------------------
+# Transformers / OCR
+# -------------------------
+transformers==4.40.2
+sentencepiece==0.2.0
+tokenizers==0.19.1
+
+# -------------------------
+# Explainability (LIME)
+# -------------------------
+lime==0.2.0.1
+scikit-image==0.22.0
+scikit-learn==1.4.1.post1
+
+# -------------------------
+# Interface
+# -------------------------
+streamlit==1.33.0
+streamlit-drawable-canvas==0.9.3
+
+# -------------------------
+# Utils / Visualization
+# -------------------------
+matplotlib==3.8.4
+opencv-python==4.9.0.80
+tqdm==4.66.2
