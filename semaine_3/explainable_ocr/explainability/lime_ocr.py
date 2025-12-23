@@ -17,7 +17,7 @@ Caractéristiques :
     - images perturbées (debug / pédagogie)
     - scores OCR associés aux perturbations
 
-Compatible TrOCR et OCRModel.
+Compatible TrOCR et OCRBase.
 """
 
 from typing import Dict, Any, List, Optional, Callable
@@ -29,7 +29,8 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics.pairwise import cosine_distances
 from tqdm import tqdm
 
-from ocr.base import OCRModel
+from ocr.base import OCRBase
+
 
 
 # ---------------------------------------------------------------------
@@ -67,7 +68,7 @@ def mask_image(
 # ---------------------------------------------------------------------
 
 def token_score(
-    ocr_model: OCRModel,
+    ocr_model: OCRBase,
     image_np01: np.ndarray,
     token_index: int
 ) -> float:
@@ -88,7 +89,7 @@ def token_score(
 # ---------------------------------------------------------------------
 
 def explain_token_lime(
-    ocr_model: OCRModel,
+    ocr_model: OCRBase,
     image: Image.Image,
     token_index: int,
     n_segments: int = 40,

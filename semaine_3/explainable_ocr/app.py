@@ -1,289 +1,507 @@
-import streamlit as st
+# ============================================================
+# Explainable OCR — Application Streamlit
+# ============================================================
+#
+# Cette application permet d'expliquer visuellement
+# les décisions prises par un modèle OCR (TrOCR ou YOLO OCR)
+# en utilisant des méthodes de perturbations locales
+# inspirées de LIME.
+#
+# Objectif :
+# - Comprendre POURQUOI un texte est reconnu
+# - Fournir une explication lisible pour un humain
+# - Outil d’audit, pas d’inférence industrielle
+#
+# ============================================================
+
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from PIL import Image
-from skimage.color import label2rgb
-from skimage.segmentation import slic
-import hashlib
-import time
+import streamlit as st
+from PIL import Image, ImageDraw
+
+from skimage.segmentation import mark_boundaries
 
 from ocr.trocr_model import TrOCRModel
+from ocr.yolo_ocr_model import YOLOOCRModel
 from explainability.lime_ocr import explain_token_lime
+from explainability.yolo_ocr import explain_yolo_ocr
 
 
-# ---------------------------------------------------------------------
-# Utils
-# ---------------------------------------------------------------------
+# ============================================================
+# 1. Fonctions utilitaires
+# ============================================================
 
 def image_hash(img: Image.Image) -> str:
-    return hashlib.md5(np.array(img).tobytes()).hexdigest()
+    """
+    Calcule un hash MD5 à partir des pixels de l’image.
+
+    Utilité :
+    - détecter un changement d’image
+    - réinitialiser proprement l’état Streamlit
+    """
+    return hashlib.md5(np.asarray(img).tobytes()).hexdigest()
 
 
-def build_heatmap(segments, sp_importance, top_k):
-    heatmap = np.zeros_like(segments, dtype=np.float32)
+def strong_red_overlay(
+    image_np: np.ndarray,
+    heatmap: np.ndarray,
+    alpha: float = 0.85,
+) -> np.ndarray:
+    """
+    Applique un overlay rouge fortement contrasté
+    pour visualiser l'importance des régions.
 
-    positive_idx = np.where(sp_importance > 0)[0]
-    if len(positive_idx) == 0:
-        return heatmap, np.array([], dtype=int)
+    Rouge intense   → région critique
+    Rouge modéré    → région contributrice
+    Pas de rouge    → région ignorée
+    """
+    img = image_np.astype(np.float32) / 255.0
+    heat = heatmap[..., None]
 
-    sorted_idx = positive_idx[np.argsort(sp_importance[positive_idx])[::-1]]
-    top_idx = sorted_idx[:top_k]
+    overlay = img.copy()
 
-    for seg_id in top_idx:
-        heatmap[segments == seg_id] = sp_importance[seg_id]
+    overlay[..., 0] = np.clip(
+        (1 - alpha * heat[..., 0]) * overlay[..., 0] + alpha * heat[..., 0],
+        0, 1
+    )
 
-    heatmap /= heatmap.max()
-    return heatmap, top_idx
+    overlay[..., 1] *= (1 - 0.6 * heat[..., 0])
+    overlay[..., 2] *= (1 - 0.6 * heat[..., 0])
 
-
-def generate_masked_examples(image, segments, n_examples=4, seed=0):
-    rng = np.random.RandomState(seed)
-    img_np = np.array(image).astype(np.float32) / 255.0
-    n_sp = int(segments.max() + 1)
-
-    examples = []
-    for _ in range(n_examples):
-        mask = rng.randint(0, 2, size=n_sp)
-        masked = img_np.copy()
-        for sp_id in range(n_sp):
-            if mask[sp_id] == 0:
-                masked[segments == sp_id] = 0.0
-        examples.append(masked)
-
-    return examples
+    return np.clip(overlay, 0, 1)
 
 
-# ---------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------
+def draw_boxes(image, boxes, labels=None, selected=None):
+    """
+    Dessine les bounding boxes YOLO sur l’image.
+    """
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
 
-st.set_page_config(
-    page_title="Explainable OCR",
-    page_icon="🔍",
-    layout="wide"
-)
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = box
+        is_sel = i == selected
+        color = "red" if is_sel else "gray"
+        width = 4 if is_sel else 2
 
-st.markdown("# 🔍 Explainable OCR")
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+
+        if labels:
+            draw.text((x1, max(0, y1 - 14)), labels[i], fill=color)
+
+    return img
+
+
+# ============================================================
+# 2. Gestion de l’état Streamlit
+# ============================================================
+
+def init_state():
+    """
+    Initialise toutes les variables persistantes.
+    Streamlit est stateless par défaut.
+    """
+    defaults = dict(
+        ocr_type=None,
+        ocr_model=None,
+        model_key=None,
+        image_key=None,
+        ocr_result=None,
+        target_idx=None,
+        seg_output=None,
+        base_image=None,
+        segmentation_done=False,
+        explanation_done=False,
+    )
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
+
+
+# ============================================================
+# 3. Configuration de la page
+# ============================================================
+
+st.set_page_config(page_title="Explicabilité et OCR", layout="wide")
+st.title("Explicabilité et OCR")
+
+st.markdown("""
+### Objectif de l'application
+
+Cette application permet de **comprendre visuellement**
+les décisions prises par un modèle OCR.
+
+👉 On ne cherche pas la performance maximale,  
+👉 mais la **compréhension humaine** et l’**audit**.
+""")
+
 st.markdown("---")
 
 
-# ---------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------
-
-for key, default in {
-    "ocr_result": None,
-    "ocr_image_hash": None,
-    "segments": None,
-    "segmentation_done": False,
-    "lime_output": None,
-    "explanation_done": False,
-    "stop_lime": False,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
-
-
-# ---------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------
+# ============================================================
+# 4. Barre latérale — paramètres utilisateur
+# ============================================================
 
 with st.sidebar:
+    st.header("🧠 Moteur OCR")
+
+    ocr_choice = st.radio(
+        "Choisissez le modèle OCR",
+        ["TrOCR (séquentiel)", "YOLO OCR (détection)"]
+    )
+
+    uploaded = None
+    if ocr_choice.startswith("YOLO"):
+        uploaded = st.file_uploader("Modèle YOLO (.pt)", type=["pt"])
+
+    st.markdown("---")
     st.header("⚙️ Paramètres d’explication")
 
-    n_samples = st.slider("Perturbations", 20, 300, 100, 20)
-    n_segments = st.slider("Superpixels", 10, 80, 40, 5)
-    compactness = st.slider("Compacité", 1.0, 50.0, 10.0)
+    n_samples = st.slider("Perturbations (TrOCR)", 20, 300, 100, 20)
+    n_segments = st.slider("Nombre de superpixels", 3, 50, 25, 1)
+    compactness = st.slider("Compacité des superpixels", 1.0, 40.0, 10.0)
+
+    st.markdown("---")
+    st.header("👁️ Affichage")
+
     top_k = st.slider("Régions affichées", 1, 10, 3)
 
-    if st.button("🛑 Stop calcul"):
-        st.session_state.stop_lime = True
 
+# ============================================================
+# 5. Chargement du modèle OCR
+# ============================================================
 
-# ---------------------------------------------------------------------
-# 1. Image upload
-# ---------------------------------------------------------------------
+if ocr_choice.startswith("TrOCR"):
+    if st.session_state.ocr_type != "trocr":
+        st.session_state.ocr_model = TrOCRModel()
+        st.session_state.ocr_type = "trocr"
+        st.session_state.segmentation_done = False
+        st.session_state.explanation_done = False
+else:
+    if uploaded is None:
+        st.info("Veuillez charger un modèle YOLO OCR.")
+        st.stop()
 
-st.markdown("## 1. Image d’entrée")
+    path = Path("uploaded_models") / uploaded.name
+    path.parent.mkdir(exist_ok=True)
+    if not path.exists():
+        path.write_bytes(uploaded.read())
 
-uploaded_file = st.file_uploader(
-    "Déposez une image contenant du texte",
-    type=["png", "jpg", "jpeg"]
-)
-
-if uploaded_file is None:
-    st.stop()
-
-image = Image.open(uploaded_file).convert("RGB")
-img_hash = image_hash(image)
-
-
-# ---------------------------------------------------------------------
-# 2. OCR (caché)
-# ---------------------------------------------------------------------
-
-@st.cache_resource
-def load_ocr():
-    return TrOCRModel()
-
-ocr_model = load_ocr()
-
-if st.session_state.ocr_image_hash != img_hash:
-    with st.spinner("🔎 OCR en cours…"):
-        st.session_state.ocr_result = ocr_model.predict(image)
-        st.session_state.ocr_image_hash = img_hash
+    key = f"yolo::{path.name}"
+    if st.session_state.model_key != key:
+        st.session_state.ocr_model = YOLOOCRModel(str(path))
+        st.session_state.ocr_type = "yolo"
+        st.session_state.model_key = key
         st.session_state.segmentation_done = False
         st.session_state.explanation_done = False
 
-ocr_result = st.session_state.ocr_result
-tokens = ocr_result["tokens"]
-token_probs = ocr_result["token_probs"]
+ocr_model = st.session_state.ocr_model
 
 
-# ---------------------------------------------------------------------
-# 3. Résultat OCR
-# ---------------------------------------------------------------------
+# ============================================================
+# 6. Chargement de l’image
+# ============================================================
 
-st.markdown("## 2. Résultat OCR")
+st.markdown("## 1️⃣ Image d’entrée")
 
-c1, c2 = st.columns([1, 1.2])
-with c1:
-    st.image(image, caption="Image d’entrée", use_column_width=True)
-with c2:
-    st.info(ocr_result["text"])
+st.markdown("""
+**Étape 1 :**  
+Veuillez charger une image contenant du texte.
+""")
+
+img_file = st.file_uploader("Charger une image", type=["png", "jpg", "jpeg"])
+if img_file is None:
+    st.stop()
+
+image = Image.open(img_file).convert("RGB")
+img_key = image_hash(image)
+
+if st.session_state.image_key != img_key:
+    st.session_state.image_key = img_key
+    st.session_state.segmentation_done = False
+    st.session_state.explanation_done = False
+    st.session_state.target_idx = None
+
+st.image(image, use_column_width=True)
 
 
-# ---------------------------------------------------------------------
-# 4. Segmentation visuelle (PERSISTANTE)
-# ---------------------------------------------------------------------
+# ============================================================
+# 7. Prédiction OCR
+# ============================================================
 
-st.markdown("## 🧩 3. Segmentation visuelle")
+st.markdown("## 2️⃣ Prédiction OCR")
 
-if st.button("▶️ Générer segmentation"):
-    with st.spinner("Segmentation en cours…"):
-        img_np = np.array(image).astype(np.float32) / 255.0
-        st.session_state.segments = slic(
-            img_np,
-            n_segments=n_segments,
-            compactness=compactness,
-            sigma=1,
-            start_label=0
-        )
+
+if st.session_state.ocr_type == "trocr":
+    st.markdown("""
+### Comment fonctionne TrOCR ?  
+
+#### Principe général
+TrOCR est un modèle OCR **séquentiel** qui transforme une image en une **suite de tokens**
+(un token peut contenir plusieurs caractères).
+
+#### Comment le modèle décide
+- Le modèle regarde **toute l’image**
+- Il prédit le texte **token par token**
+- Chaque token dépend :
+  - de l’image
+  - **des tokens déjà prédits**
+
+#### Ce que l’on explique ici
+Quand vous sélectionnez un token,  
+l’explication montre **quelles zones de l’image ont le plus influencé sa prédiction**,  
+en gardant **le contexte des tokens précédents fixe**.
+
+On explique donc **l’influence visuelle sur une décision précise du modèle**.
+
+""")
+
+else:
+    st.markdown("""
+### Comment fonctionne YOLO OCR ?
+
+### Comment fonctionne YOLO OCR ?
+
+#### Principe général
+YOLO OCR est un modèle OCR basé sur la **détection d’objets**.
+
+Il ne lit pas le texte comme une séquence globale,
+mais **identifie des zones de texte indépendantes** dans l’image.
+
+#### Comment le modèle décide
+- Le modèle analyse l’image entière
+- Il détecte des **bounding boxes** correspondant à des zones de texte
+- Chaque zone est reconnue **indépendamment des autres**, avec un score de confiance
+
+####  Ce que l’on explique ici
+Quand vous sélectionnez une bounding box,  
+l’explication montre **quelles régions à l’intérieur de cette zone**
+ont le plus influencé la reconnaissance du texte associé.
+
+ YOLO OCR base sa décision sur la **localisation et le contenu visuel local**,
+sans dépendance au contexte des autres zones.
+
+""")
+
+
+if st.button("Lancer l’OCR"):
+    with st.spinner("OCR en cours..."):
+        st.session_state.ocr_result = ocr_model.predict(image)
+        st.session_state.segmentation_done = False
+        st.session_state.explanation_done = False
+
+if st.session_state.ocr_result is None:
+    st.stop()
+
+ocr = st.session_state.ocr_result
+
+
+# ============================================================
+# 8. Affichage du résultat OCR
+# ============================================================
+
+if st.session_state.ocr_type == "trocr":
+    st.markdown("**Texte reconnu :**")
+    st.write(ocr["text"])
+else:
+    boxes = ocr.get("boxes", [])
+    tokens = ocr.get("tokens", [])
+
+    if not boxes:
+        st.warning("Aucune détection.")
+        st.stop()
+
+    st.markdown("Zones détectées :")
+    st.image(draw_boxes(image, boxes, tokens), use_column_width=True)
+
+
+# ============================================================
+# 9. Sélection de la cible à expliquer
+# ============================================================
+
+st.markdown("## 3️⃣ Sélection de la décision à expliquer")
+
+st.markdown("""
+On choisit **une décision locale précise** :
+- un token (TrOCR)
+- ou une bounding box (YOLO)
+""")
+
+if st.session_state.ocr_type == "trocr":
+    idx = st.selectbox(
+        "Token à expliquer",
+        range(len(ocr["tokens"])),
+        format_func=lambda i: f"{i} — '{ocr['tokens'][i]}' (p={ocr['token_probs'][i]:.2f})"
+    )
+else:
+    idx = st.selectbox(
+        "Bounding box à expliquer",
+        range(len(ocr["boxes"])),
+        format_func=lambda i: f"{i} — {ocr['tokens'][i]} (conf={ocr['token_probs'][i]:.2f})"
+    )
+    st.image(draw_boxes(image, ocr["boxes"], ocr["tokens"], selected=idx),
+             use_column_width=True)
+
+st.session_state.target_idx = idx
+
+
+# ============================================================
+# 10. Segmentation & perturbations
+# ============================================================
+
+st.markdown("## 4️⃣ Segmentation & perturbations")
+
+st.markdown("""
+Lors de cette étape, on applique une méthode d’explicabilité locale basée sur des perturbations.
+
+L’image est d’abord découpée en **superpixels**, c’est-à-dire en régions cohérentes visuellement.
+Ces régions servent d’unités d’analyse interprétables.
+
+Ensuite, différentes **perturbations locales** sont générées en masquant ou modifiant certains superpixels.
+Pour chaque perturbation, on observe comment la **prédiction du modèle change**.
+
+En analysant l’impact de chaque superpixel sur la probabilité du token (ou de la zone) sélectionné(e),
+on peut estimer **l’importance de chaque région de l’image dans la décision du modèle**.
+
+""")
+
+if st.button("Lancer la segmentation"):
+    bar = st.progress(0.0)
+
+    def progress(p):
+        bar.progress(p)
+
+    with st.spinner("Segmentation et perturbations..."):
+        if st.session_state.ocr_type == "trocr":
+            out = explain_token_lime(
+                ocr_model,
+                image,
+                idx,
+                n_segments,
+                compactness,
+                n_samples,
+                progress_callback=progress,
+            )
+            base_image = image
+        else:
+            out = explain_yolo_ocr(
+                ocr_model,
+                image,
+                idx,
+                n_segments=n_segments,
+                compactness=compactness,
+                progress_callback=progress,
+            )
+            base_image = out["image"]
+
+    st.session_state.seg_output = out
+    st.session_state.base_image = base_image
     st.session_state.segmentation_done = True
     st.session_state.explanation_done = False
 
-# 🔒 AFFICHAGE PERSISTANT
-if st.session_state.segmentation_done:
-
-    segments = st.session_state.segments
-
-    seg_vis = label2rgb(segments, np.array(image), bg_label=0)
-    st.image(seg_vis, caption="Segmentation (superpixels)", use_column_width=True)
-
-    st.markdown("### 🔍 Exemples de masquage des superpixels")
-
-    masked_examples = generate_masked_examples(image, segments)
-    cols = st.columns(len(masked_examples))
-    for col, img in zip(cols, masked_examples):
-        col.image(img, use_column_width=True)
-
-
-# ---------------------------------------------------------------------
-# 5. Choix du token
-# ---------------------------------------------------------------------
-
-st.markdown("## 🔤 4. Choix du token")
+    st.success("Segmentation terminée")
 
 if not st.session_state.segmentation_done:
-    st.info("Veuillez d’abord effectuer la segmentation.")
     st.stop()
 
-token_choice = st.selectbox(
-    "Token à expliquer",
-    range(len(tokens)),
-    format_func=lambda i: f"{i:02d} — '{tokens[i]}' (p={token_probs[i]:.2f})"
+
+# ============================================================
+# 11. Visualisation de la segmentation
+# ============================================================
+
+segments = st.session_state.seg_output["segments"]
+
+roi_image = image if st.session_state.ocr_type == "trocr" else st.session_state.seg_output["image"]
+
+st.markdown("### 🔍 Visualisation des superpixels")
+
+seg_vis = mark_boundaries(
+    np.asarray(roi_image),
+    segments,
+    color=(1, 0, 0),
+    mode="thick",
 )
 
+st.image(seg_vis, use_column_width=True)
 
-# ---------------------------------------------------------------------
-# 6. LIME (RECALCULÉ PAR TOKEN)
-# ---------------------------------------------------------------------
 
-st.markdown("## 🔥 5. Explication de la prédiction")
+# ============================================================
+# 12. Explication visuelle finale
+# ============================================================
 
-if st.button("▶️ Expliquer ce token"):
+st.markdown("## 5️⃣ Explication visuelle finale")
 
-    progress_bar = st.progress(0.0)
-    eta_text = st.empty()
-    start = time.time()
+st.markdown("""
+Cette visualisation met en évidence les régions de l’image
+qui contribuent le plus à la décision du modèle pour la prédiction sélectionnée.
 
-    def progress_cb(p):
-        progress_bar.progress(p)
-        elapsed = time.time() - start
-        if p > 0:
-            eta = elapsed * (1 - p) / p
-            eta_text.markdown(f"⏳ Temps restant estimé : `{eta:.1f}s`")
+Les zones colorées avec une intensité plus forte
+correspondent aux régions ayant **l’impact le plus important**
+sur la probabilité du token ou de la zone expliquée.
+ 
+""")
 
-    out = explain_token_lime(
-        ocr_model=ocr_model,
-        image=image,
-        token_index=token_choice,
-        n_segments=n_segments,
-        compactness=compactness,
-        n_samples=n_samples,
-        progress_callback=progress_cb,
-        stop_flag={"stop": st.session_state.stop_lime},
-    )
-
-    eta_text.empty()
-    st.session_state.lime_output = out
+if st.button("Afficher l’explication"):
     st.session_state.explanation_done = True
-
 
 if not st.session_state.explanation_done:
     st.stop()
 
+importance = st.session_state.seg_output["sp_importance"]
+order = np.argsort(importance)[::-1][:top_k]
 
-# ---------------------------------------------------------------------
-# 7. Visualisation finale
-# ---------------------------------------------------------------------
+heatmap = np.zeros_like(segments, dtype=np.float32)
+for i in order:
+    heatmap[segments == i] = importance[i]
 
-segments = st.session_state.segments
-sp_importance = st.session_state.lime_output["sp_importance"]
+heatmap /= heatmap.max() + 1e-8
 
-heatmap, top_idx = build_heatmap(segments, sp_importance, top_k)
-
-img_np = np.array(image).astype(np.float32) / 255.0
-gray = 1 - np.mean(img_np, axis=2)
-text_mask = gray > 0.3
-
-overlay = img_np.copy()
-overlay[text_mask] = (
-    overlay[text_mask] * (1 - heatmap[text_mask][:, None])
-    + np.array([1.0, 0.0, 0.0]) * heatmap[text_mask][:, None]
-)
-overlay = np.clip(overlay, 0, 1)
-
-st.image(
-    overlay,
-    caption=f"Zones explicatives (top {top_k})",
-    use_column_width=True
+overlay = strong_red_overlay(
+    np.asarray(st.session_state.base_image),
+    heatmap,
 )
 
-# ---------------------------------------------------------------------
-# Tableau quantitatif
-# ---------------------------------------------------------------------
+st.image(overlay, use_column_width=True)
 
-st.markdown("### 📊 Importance quantitative des régions")
 
-top_scores = sp_importance[top_idx]
-relative = top_scores / top_scores.sum()
+# ============================================================
+# 13. Tableau d’importance
+# ============================================================
+
+st.markdown("### Importance des régions")
+
+abs_imp = importance[order]
+rel_imp = abs_imp / abs_imp.sum()
 
 df = pd.DataFrame({
-    "Rang": range(1, len(top_idx) + 1),
-    "Superpixel ID": top_idx,
-    "Importance brute": top_scores,
-    "Importance relative (%)": (100 * relative).round(2),
+    "Rang": range(1, len(order) + 1),
+    "Superpixel": order,
+    "Importance absolue": abs_imp.round(6),
+    "Importance relative (%)": (100 * rel_imp).round(2),
 })
 
-st.dataframe(df, use_container_width=True, hide_index=True)
+st.dataframe(df, use_container_width=True)
+
+
+# ============================================================
+# 14. Conclusion pédagogique
+# ============================================================
+
+st.markdown("""
+## Conclusion
+
+Cette application montre **comment** et **où**
+un modèle OCR regarde pour prendre une décision.
+
+Conçue pour :
+- interprétabilité
+- audit
+- démonstration scientifique
+
+""")

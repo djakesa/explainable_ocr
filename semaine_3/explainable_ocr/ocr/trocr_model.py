@@ -2,10 +2,8 @@
 trocr_model.py
 ==============
 
-Implémentation TrOCR conforme à l'interface OCRModel.
-- Chargement depuis un dossier local ou HF
-- Prédiction image -> texte
-- Tokens + probabilités (token-level)
+Implémentation TrOCR (OCR séquentiel).
+Compatible avec LIME (token-level explainability).
 """
 
 from typing import Dict, List
@@ -14,24 +12,21 @@ from PIL import Image
 
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
-from ocr.base import OCRModel
+from ocr.base import OCRBase
 
 
-class TrOCRModel(OCRModel):
+class TrOCRModel(OCRBase):
+    """
+    OCR séquentiel basé sur TrOCR.
+    """
+
+    ocr_type = "sequence"
+
     def __init__(
         self,
         model_path: str = "model/trocr-base-handwritten",
         device: str | None = None,
     ):
-        """
-        Parameters
-        ----------
-        model_path : str
-            Chemin local vers le modèle TrOCR ou nom HF.
-        device : str | None
-            "cuda", "cpu" ou None (auto)
-        """
-
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         # Processor = image processor + tokenizer
@@ -74,7 +69,6 @@ class TrOCRModel(OCRModel):
             max_length=64,
         )
 
-        # Séquence complète (inclut <bos> et <eos>)
         generated_ids = outputs.sequences[0]
 
         # Texte final
@@ -87,8 +81,6 @@ class TrOCRModel(OCRModel):
         tokens: List[str] = []
         token_probs: List[float] = []
 
-        # outputs.scores[t] = logits pour le token généré à l'étape t+1
-        # (car t=0 correspond au premier token après <bos>)
         for t, scores_t in enumerate(outputs.scores):
             probs_t = torch.softmax(scores_t[0], dim=-1)
 
@@ -100,7 +92,6 @@ class TrOCRModel(OCRModel):
                 skip_special_tokens=True
             )
 
-            # On ignore les tokens vides
             if token_str.strip():
                 tokens.append(token_str)
                 token_probs.append(prob)
@@ -113,28 +104,22 @@ class TrOCRModel(OCRModel):
 
 
 # ---------------------------------------------------------------------
-# Test local (sans interface)
+# Test local
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    """
-    Lancer depuis la racine du projet :
-
-    python -m ocr.trocr_model
-    """
-
     from pathlib import Path
 
     img_path = Path("examples/test_anglais.png")
     if not img_path.exists():
-        raise FileNotFoundError(f"Image de test introuvable : {img_path}")
+        raise FileNotFoundError(img_path)
 
     image = Image.open(img_path).convert("RGB")
 
     ocr = TrOCRModel()
     result = ocr.predict(image)
 
-    print("\n--- OCR RESULT ---")
+    print("\n--- TrOCR RESULT ---")
     print("Texte reconnu :", result["text"])
     print("\nTokens :")
     for t, p in zip(result["tokens"], result["token_probs"]):

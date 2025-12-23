@@ -1,41 +1,52 @@
-"""
-base.py
-=======
+# ocr/base.py
+from __future__ import annotations
 
-Interface abstraite pour tous les modèles OCR du projet.
-
-Objectif :
-- Garantir une sortie standardisée
-- Permettre le multi-modèle (TrOCR, PARSeq, CRNN, etc.)
-- Isoler l'explicabilité (LIME) de la logique OCR
-"""
-
-from typing import Dict, List
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List, Dict, Any
 from PIL import Image
 
 
-class OCRModel:
+@dataclass
+class OCRPrediction:
+    text: str
+    tokens: List[str]
+    token_probs: List[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "tokens": self.tokens,
+            "token_probs": self.token_probs,
+        }
+
+
+class OCRBase(ABC):
     """
-    Interface commune à TOUS les modèles OCR.
+    Contrat commun pour tous les moteurs OCR utilisés dans l'app.
+    LIME a besoin de token_probs pour un token_index donné.
     """
 
-    def predict(self, image: Image.Image) -> Dict[str, List]:
+    @abstractmethod
+    def predict(self, image: Image.Image) -> Dict[str, Any]:
         """
-        Effectue une prédiction OCR sur une image.
-
-        Parameters
-        ----------
-        image : PIL.Image.Image
-
-        Returns
-        -------
-        dict :
-            {
-                "text": str,
-                "tokens": List[str],
-                "token_probs": List[float]
-            }
+        Doit retourner un dict:
+        {
+            "text": str,
+            "tokens": List[str],
+            "token_probs": List[float]
+        }
         """
-        raise NotImplementedError(
-            "Chaque modèle OCR doit implémenter la méthode predict()"
-        )
+        raise NotImplementedError
+
+    def predict_token_prob(self, image: Image.Image, token_index: int) -> float:
+        """
+        Helper standard (utilisé par LIME) : renvoie P(token_index).
+        Par défaut, appelle predict(). Les modèles peuvent override
+        si une version plus rapide est possible.
+        """
+        out = self.predict(image)
+        probs = out.get("token_probs", [])
+        if token_index < 0 or token_index >= len(probs):
+            return 0.0
+        return float(probs[token_index])
